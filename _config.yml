@@ -1,0 +1,17 @@
+title: "Abhash's Blog"
+email: abhash_sinha@hotmail.com
+description: "Thoughts on AI, DevOps, and local LLM hosting."
+url: "https://sinha-abhash.github.io"
+
+author:
+  name: Abhash Sinha
+  github: sinha-abhash
+
+
+minima:
+  skin: classic
+
+show_excerpts: true
+
+plugins:
+  - jekyll-feed

@@ -1,0 +1,552 @@
+---
+layout: blogpost
+title: "Run Any LLM Locally with vLLM + Docker"
+date: 2026-03-22
+author: "Abhash Sinha"
+categories: [AI, DevOps]
+tags: [vllm, docker, llm, local-ai, inference]
+---
+
+<header>
+  <div class="tag">Engineering · Infrastructure · LLMs</div>
+  <h1>Run <span>Any LLM</span> Locally With vLLM and Docker</h1>
+  <div class="meta">
+    <span>March 2026</span>
+    <span class="meta-dot">·</span>
+    <span>20 min read</span>
+    <span class="meta-dot">·</span>
+    <span>Requires: NVIDIA GPU + Docker</span>
+  </div>
+  <div class="hero-line"></div>
+</header>
+
+<main>
+
+  <p class="lead animate">
+    Calling an API is easy — until you start worrying about what leaves your machine, how much it costs per token, or why there's a 30-second timeout on every request. Self-hosting changes that equation entirely. This guide walks through hosting any Hugging Face model locally using vLLM and Docker, so you get a production-grade OpenAI-compatible endpoint running on your own GPU.
+  </p>
+
+  <!-- ── SECTION 1 ── -->
+  <section class="animate">
+    <h2 data-num="01">What Is vLLM, and Why Should You Care?</h2>
+    <p>
+      <a href="https://github.com/vllm-project/vllm" target="_blank" style="color:inherit;text-decoration:underline;text-decoration-color:var(--accent);text-underline-offset:3px;">vLLM</a> is a fast inference engine for large language models. The original research behind it introduced <strong>PagedAttention</strong> — a technique that manages GPU memory the way operating systems manage RAM, preventing the fragmentation that normally wastes 20–40% of your VRAM on other frameworks. The practical upshot: higher throughput, more concurrent requests, and significantly faster time-to-first-token.
+    </p>
+    <p>
+      Beyond the raw performance, vLLM exposes an <strong>OpenAI-compatible REST API</strong> out of the box. That means any code you've already written against the OpenAI SDK works without modification — you just point it at <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">localhost:8000</code> instead of <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">api.openai.com</code>. For local development and private deployments, this is hard to beat.
+    </p>
+    <div class="callout">
+      <strong>Who this is for:</strong> ML engineers who want a reproducible, low-friction way to host any HuggingFace model without writing custom serving code. If you've ever wasted an afternoon wiring up FastAPI around a <code style="font-family:'DM Mono',monospace;font-size:0.88em">transformers</code> pipeline, this is the saner path.
+    </div>
+  </section>
+
+  <!-- ── SECTION 2 ── -->
+  <section class="animate">
+    <h2 data-num="02">Before You Start</h2>
+    <p>You'll need the following in place before anything else:</p>
+    <ul style="margin: 0 0 20px 24px; color:var(--text-dim); line-height:2.1;">
+      <li>An <strong>NVIDIA GPU</strong> with enough VRAM for your chosen model (7B models need ~16 GB; 70B models need 80 GB+)</li>
+      <li><strong>Docker</strong> with the NVIDIA Container Toolkit installed</li>
+      <li>A <strong>Hugging Face account</strong> and a token if you're pulling gated models like Llama</li>
+      <li><strong>Disk space</strong> — model weights are large; a 7B model is roughly 13–14 GB</li>
+    </ul>
+    <p>
+      Check what GPUs you have available by running:
+    </p>
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-dots"><span></span><span></span><span></span></div>
+        <span class="code-label">bash</span>
+      </div>
+      <pre>nvidia-smi -L</pre>
+    </div>
+    <p>
+      If that command gives you a list of GPUs rather than an error, you're ready to move on. If CUDA isn't visible inside Docker, make sure you've installed the <a href="https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html" style="color:var(--accent)">NVIDIA Container Toolkit</a> and that your Docker daemon is configured to use it.
+    </p>
+  </section>
+
+  <!-- ── SECTION 3 ── -->
+  <section class="animate">
+    <h2 data-num="03">The Dockerfile — Build Once, Use Forever</h2>
+    <p>
+      The goal here is a single Docker image that can serve <em>any</em> model by passing a name at runtime. No rebuilding every time you want to try something new — just change an environment variable.
+    </p>
+    <p>
+      Create a file called <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">Dockerfile</code> and paste this in:
+    </p>
+
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-dots"><span></span><span></span><span></span></div>
+        <span class="code-label">Dockerfile</span>
+      </div>
+      <pre><span class="kw">FROM</span> nvcr.io/nvidia/vllm:26.01-py3
+
+<span class="kw">WORKDIR</span> /app
+
+<span class="cm"># Hugging Face cache — MUST match the volume mount path</span>
+<span class="kw">ENV</span> <span class="var">HF_HOME</span>=/models
+<span class="kw">ENV</span> <span class="var">TRANSFORMERS_CACHE</span>=/models
+<span class="kw">ENV</span> <span class="var">TORCH_HOME</span>=/models
+
+<span class="cm"># Configurable defaults — override at runtime with -e</span>
+<span class="kw">ENV</span> <span class="var">MODEL_ID</span>=<span class="str">""</span>
+<span class="kw">ENV</span> <span class="var">SERVED_MODEL_NAME</span>=<span class="str">""</span>
+<span class="kw">ENV</span> <span class="var">TENSOR_PARALLEL_SIZE</span>=<span class="num">1</span>
+<span class="kw">ENV</span> <span class="var">MAX_NUM_SEQS</span>=<span class="num">8</span>
+<span class="kw">ENV</span> <span class="var">MAX_MODEL_LEN</span>=<span class="num">32768</span>
+<span class="kw">ENV</span> <span class="var">DTYPE</span>=auto
+<span class="kw">ENV</span> <span class="var">GPU_MEMORY_UTILIZATION</span>=<span class="num">0.90</span>
+<span class="kw">ENV</span> <span class="var">QUANTIZATION</span>=<span class="str">""</span>
+<span class="kw">ENV</span> <span class="var">EXTRA_ARGS</span>=<span class="str">""</span>
+
+<span class="kw">RUN</span> pip install --no-cache-dir accelerate bitsandbytes
+
+<span class="kw">EXPOSE</span> <span class="num">8000</span>
+
+<span class="kw">CMD</span> [<span class="str">"bash"</span>, <span class="str">"-c"</span>, <span class="str">"\
+  if [ -z \"$MODEL_ID\" ]; then \
+    echo 'ERROR: MODEL_ID is not set. Pass it with -e MODEL_ID=...' && exit 1; \
+  fi; \
+  SERVED_NAME=${SERVED_MODEL_NAME:-$(basename $MODEL_ID)}; \
+  QUANT_ARG=$([ -n \"$QUANTIZATION\" ] && echo \"--quantization $QUANTIZATION\" || echo \"\"); \
+  vllm serve $MODEL_ID \
+    --served-model-name $SERVED_NAME \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --tensor-parallel-size $TENSOR_PARALLEL_SIZE \
+    --max-num-seqs $MAX_NUM_SEQS \
+    --max-model-len $MAX_MODEL_LEN \
+    --gpu-memory-utilization $GPU_MEMORY_UTILIZATION \
+    --trust-remote-code \
+    --dtype $DTYPE \
+    $QUANT_ARG \
+    $EXTRA_ARGS \
+"</span>]</pre>
+    </div>
+
+    <p>Build the image:</p>
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-dots"><span></span><span></span><span></span></div>
+        <span class="code-label">bash</span>
+      </div>
+      <pre>docker build -t vllm-universal .</pre>
+    </div>
+    <p>
+      This takes a few minutes the first time. After that, you never rebuild it — you just swap the model at runtime.
+    </p>
+    <div class="callout">
+      <strong>Why set HF_HOME inside the Dockerfile?</strong> If you don't, the model downloads into the container's filesystem. When you delete the container, the 13 GB download goes with it. By pointing <code style="font-family:'DM Mono',monospace;font-size:0.88em">HF_HOME</code> to <code style="font-family:'DM Mono',monospace;font-size:0.88em">/models</code> and mounting your host cache there, the weights persist on disk between runs.
+    </div>
+  </section>
+
+  <!-- ── SECTION 4 ── -->
+  <section class="animate">
+    <h2 data-num="04">Running Your First Model</h2>
+    <p>
+      Let's spin up Mistral 7B Instruct. The pattern here is the same for almost any model — just swap the name.
+    </p>
+
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-dots"><span></span><span></span><span></span></div>
+        <span class="code-label">bash</span>
+      </div>
+      <pre>MODEL=<span class="str">"mistralai/Mistral-7B-Instruct-v0.3"</span> && docker run -it --gpus all \
+  -p <span class="num">8000</span>:<span class="num">8000</span> \
+  -v ~/.cache/huggingface:/models \
+  -e <span class="var">MODEL_ID</span>=<span class="str">"$MODEL"</span> \
+  --name $(basename <span class="str">"$MODEL"</span>) \
+  --ipc=host \
+  --ulimit memlock=<span class="num">-1</span> \
+  --ulimit stack=<span class="num">67108864</span> \
+  vllm-universal</pre>
+    </div>
+
+    <p>
+      A few things are worth explaining here. The <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">--ipc=host</code> flag and the two <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">--ulimit</code> flags are <strong>not optional</strong>. Without them, CUDA shared memory operations fail with cryptic errors that are annoying to debug. Always include them.
+    </p>
+
+    <p>
+      The model will download on first run (once, thanks to the volume mount), then you'll see vLLM print its startup logs and eventually:
+    </p>
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-dots"><span></span><span></span><span></span></div>
+        <span class="code-label">output</span>
+      </div>
+      <pre>INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)</pre>
+    </div>
+    <p>You're live.</p>
+
+    <h3>Gated Models (Llama, etc.)</h3>
+    <p>
+      If you're pulling a model that requires Hugging Face access approval, pass your token as an environment variable:
+    </p>
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-dots"><span></span><span></span><span></span></div>
+        <span class="code-label">bash</span>
+      </div>
+      <pre>MODEL=<span class="str">"meta-llama/Llama-3-8B-Instruct"</span> && docker run -it --gpus all \
+  -p <span class="num">8000</span>:<span class="num">8000</span> \
+  -v ~/.cache/huggingface:/models \
+  -e <span class="var">MODEL_ID</span>=<span class="str">"$MODEL"</span> \
+  -e <span class="var">HF_TOKEN</span>=<span class="str">$HF_TOKEN</span> \
+  --name $(basename <span class="str">"$MODEL"</span>) \
+  --ipc=host --ulimit memlock=<span class="num">-1</span> --ulimit stack=<span class="num">67108864</span> \
+  vllm-universal</pre>
+    </div>
+
+    <h3>Multi-GPU with Tensor Parallelism</h3>
+    <p>
+      Got a 70B model and four GPUs? Use tensor parallelism to split the model across them:
+    </p>
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-dots"><span></span><span></span><span></span></div>
+        <span class="code-label">bash</span>
+      </div>
+      <pre>MODEL=<span class="str">"meta-llama/Llama-3-70B-Instruct"</span> && docker run -it --gpus all \
+  -p <span class="num">8000</span>:<span class="num">8000</span> \
+  -v ~/.cache/huggingface:/models \
+  -e <span class="var">MODEL_ID</span>=<span class="str">"$MODEL"</span> \
+  -e <span class="var">TENSOR_PARALLEL_SIZE</span>=<span class="num">4</span> \
+  --name $(basename <span class="str">"$MODEL"</span>) \
+  --ipc=host --ulimit memlock=<span class="num">-1</span> --ulimit stack=<span class="num">67108864</span> \
+  vllm-universal</pre>
+    </div>
+    <div class="callout warn">
+      <strong>Heads up:</strong> <code style="font-family:'DM Mono',monospace;font-size:0.88em">TENSOR_PARALLEL_SIZE</code> must match your actual GPU count. Setting it higher than what's available causes a Ray placement group timeout that isn't immediately obvious. Run <code style="font-family:'DM Mono',monospace;font-size:0.88em">nvidia-smi -L</code> first to confirm.
+    </div>
+  </section>
+
+  <!-- ── SECTION 5 ── -->
+  <section class="animate">
+    <h2 data-num="05">Testing the Endpoint</h2>
+    <p>
+      With the container running, you can talk to it over HTTP. First, confirm which model is loaded:
+    </p>
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-dots"><span></span><span></span><span></span></div>
+        <span class="code-label">bash</span>
+      </div>
+      <pre>curl http://localhost:<span class="num">8000</span>/v1/models</pre>
+    </div>
+    <p>Then send a chat completion request:</p>
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-dots"><span></span><span></span><span></span></div>
+        <span class="code-label">bash</span>
+      </div>
+      <pre>curl http://localhost:<span class="num">8000</span>/v1/chat/completions \
+  -H <span class="str">"Content-Type: application/json"</span> \
+  -d <span class="str">'{"model": "Mistral-7B-Instruct-v0.3", "messages": [{"role": "user", "content": "Explain PagedAttention in two sentences."}], "max_tokens": 200, "temperature": 0.7}'</span></pre>
+    </div>
+    <p>
+      The model name in the request body should match what <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">/v1/models</code> reports — which defaults to the basename of the Hugging Face path. You can override this by setting <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">SERVED_MODEL_NAME</code>.
+    </p>
+
+    <h3>Streaming Responses</h3>
+    <p>
+      vLLM supports streaming out of the box — no extra configuration required. Add <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">"stream": true</code> to your request and tokens start arriving immediately rather than waiting for the full completion:
+    </p>
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-dots"><span></span><span></span><span></span></div>
+        <span class="code-label">bash</span>
+      </div>
+      <pre>curl http://localhost:<span class="num">8000</span>/v1/chat/completions \
+  -H <span class="str">"Content-Type: application/json"</span> \
+  -d <span class="str">'{"model": "Mistral-7B-Instruct-v0.3", "messages": [{"role": "user", "content": "Count to 10."}], "max_tokens": 100, "stream": true}'</span></pre>
+    </div>
+    <p>
+      The response arrives as a series of <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">data:</code> server-sent events, each containing a partial token delta — the same format as the OpenAI API, so any client library that supports streaming there will work identically here.
+    </p>
+  </section>
+
+  <!-- ── SECTION 6 ── -->
+  <section class="animate">
+    <h2 data-num="06">Security — Don't Skip This</h2>
+    <p>
+      By default, vLLM starts with <strong>no authentication</strong>. Anyone who can reach port 8000 can query your model and rack up GPU utilization. This is fine on a laptop behind a firewall, but needs attention the moment you expose the service beyond localhost.
+    </p>
+    <p>
+      The simplest fix is the built-in <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">--api-key</code> flag. Pass it via <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">EXTRA_ARGS</code>:
+    </p>
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-dots"><span></span><span></span><span></span></div>
+        <span class="code-label">bash</span>
+      </div>
+      <pre>MODEL=<span class="str">"mistralai/Mistral-7B-Instruct-v0.3"</span> && docker run -it --gpus all \
+  -p <span class="num">8000</span>:<span class="num">8000</span> \
+  -v ~/.cache/huggingface:/models \
+  -e <span class="var">MODEL_ID</span>=<span class="str">"$MODEL"</span> \
+  -e <span class="var">EXTRA_ARGS</span>=<span class="str">"--api-key my-secret-key"</span> \
+  --name $(basename <span class="str">"$MODEL"</span>) \
+  --ipc=host --ulimit memlock=<span class="num">-1</span> --ulimit stack=<span class="num">67108864</span> \
+  vllm-universal</pre>
+    </div>
+    <p>
+      Callers then pass the key as a Bearer token:
+    </p>
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-dots"><span></span><span></span><span></span></div>
+        <span class="code-label">bash</span>
+      </div>
+      <pre>curl http://localhost:<span class="num">8000</span>/v1/chat/completions \
+  -H <span class="str">"Authorization: Bearer my-secret-key"</span> \
+  -H <span class="str">"Content-Type: application/json"</span> \
+  -d <span class="str">'{"model": "Mistral-7B-Instruct-v0.3", "messages": [{"role": "user", "content": "Hello"}], "max_tokens": 50}'</span></pre>
+    </div>
+    <div class="callout danger">
+      <strong>Never expose port 8000 publicly without authentication.</strong> For team deployments, put nginx or Caddy in front of vLLM — terminate TLS there and let the reverse proxy forward requests to the container over localhost. This also lets you assign stable DNS names and manage certs centrally.
+    </div>
+  </section>
+
+  <!-- ── SECTION 7 ── -->
+  <section class="animate">
+    <h2 data-num="07">Quantization — Cutting VRAM in Half</h2>
+    <p>
+      The <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">QUANTIZATION</code> variable accepts <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">awq</code>, <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">gptq</code>, and <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">squeezellm</code>, but they aren't interchangeable. Here's when to use which:
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Format</th>
+            <th>When to use</th>
+            <th>Notes</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>awq</td>
+            <td>Default choice for most models</td>
+            <td>Best speed/quality tradeoff; wide model support on HuggingFace</td>
+          </tr>
+          <tr>
+            <td>gptq</td>
+            <td>When an AWQ version isn't available</td>
+            <td>Slightly slower than AWQ; still widely supported</td>
+          </tr>
+          <tr>
+            <td>squeezellm</td>
+            <td>Sparse models only</td>
+            <td>Niche use case; most public models don't use it</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      <strong>AWQ is your default.</strong> Search HuggingFace for <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">model-name-AWQ</code> and you'll almost always find a pre-quantized version. A 7B model that normally needs ~16 GB of VRAM drops to around 6–8 GB with AWQ, at the cost of marginal quality degradation that's imperceptible for most tasks.
+    </p>
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-dots"><span></span><span></span><span></span></div>
+        <span class="code-label">bash</span>
+      </div>
+      <pre>MODEL=<span class="str">"TheBloke/Mistral-7B-Instruct-v0.2-AWQ"</span> && docker run -it --gpus all \
+  -p <span class="num">8000</span>:<span class="num">8000</span> \
+  -v ~/.cache/huggingface:/models \
+  -e <span class="var">MODEL_ID</span>=<span class="str">"$MODEL"</span> \
+  -e <span class="var">QUANTIZATION</span>=awq \
+  --name $(basename <span class="str">"$MODEL"</span>) \
+  --ipc=host --ulimit memlock=<span class="num">-1</span> --ulimit stack=<span class="num">67108864</span> \
+  vllm-universal</pre>
+    </div>
+  </section>
+
+  <!-- ── SECTION 8 ── -->
+  <section class="animate">
+    <h2 data-num="08">Environment Variables Reference</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Variable</th>
+            <th>Default</th>
+            <th>What it does</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>MODEL_ID</td><td><em style="color:var(--muted)">required</em></td><td>HuggingFace path, e.g. <code style="font-size:0.85em">org/model-name</code></td></tr>
+          <tr><td>SERVED_MODEL_NAME</td><td>basename of MODEL_ID</td><td>Name used in API requests</td></tr>
+          <tr><td>TENSOR_PARALLEL_SIZE</td><td>1</td><td>Number of GPUs to split the model across</td></tr>
+          <tr><td>MAX_NUM_SEQS</td><td>8</td><td>Max concurrent sequences</td></tr>
+          <tr><td>MAX_MODEL_LEN</td><td>32768</td><td>Max context length in tokens — also controls KV cache pre-allocation</td></tr>
+          <tr><td>DTYPE</td><td>auto</td><td>Data type: auto, float16, bfloat16</td></tr>
+          <tr><td>GPU_MEMORY_UTILIZATION</td><td>0.90</td><td>Fraction of VRAM to allocate</td></tr>
+          <tr><td>QUANTIZATION</td><td><em style="color:var(--muted)">none</em></td><td>awq (recommended), gptq, squeezellm</td></tr>
+          <tr><td>EXTRA_ARGS</td><td><em style="color:var(--muted)">none</em></td><td>Any additional vllm CLI flags (e.g. --api-key, --enable-chunked-prefill)</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ── SECTION 9 ── -->
+  <section class="animate">
+    <h2 data-num="09">Debugging Common Errors</h2>
+
+    <h3>Model re-downloads every run</h3>
+    <p>
+      This means the volume isn't mounted correctly. The Dockerfile sets <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">HF_HOME=/models</code>, so the volume must map to exactly <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">/models</code>. If you mount it to <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">/root/.cache/huggingface</code> instead, you'll hit this every time. The correct flag is always <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">-v ~/.cache/huggingface:/models</code>.
+    </p>
+
+    <h3>CUDA driver error / InductorError</h3>
+    <p>
+      Almost always caused by missing <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">--ipc=host</code> or the ulimit flags. Add them and try again.
+    </p>
+
+    <h3>docker: invalid reference format</h3>
+    <p>
+      This happens when you paste multi-line commands with backslash continuations directly into your terminal. The shell misparses the image name. The fix is to assign your model to a variable first (<code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">MODEL="org/name"</code>), then run the command as a single line.
+    </p>
+
+    <h3>Out of memory</h3>
+    <p>
+      vLLM pre-allocates KV cache for the <em>entire</em> context length at startup — that's why <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">MAX_MODEL_LEN</code> is the first thing to tune when you hit OOM. A model that fits at 16k context may fail at 32k simply because of this reservation. Try these options in order:
+    </p>
+    <ul style="margin: 0 0 20px 24px; color:var(--text-dim); line-height:2.3;">
+      <li>Lower <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.85em">MAX_MODEL_LEN</code> — e.g. <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.85em">-e MAX_MODEL_LEN=16384</code></li>
+      <li>Lower <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.85em">GPU_MEMORY_UTILIZATION</code> — e.g. <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.85em">-e GPU_MEMORY_UTILIZATION=0.80</code></li>
+      <li>Use a quantized model — <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.85em">-e QUANTIZATION=awq</code> cuts VRAM usage by roughly half</li>
+      <li>Use a smaller model entirely</li>
+    </ul>
+    <div class="callout">
+      <strong>Tip:</strong> Run <code style="font-family:'DM Mono',monospace;font-size:0.88em">llmfit</code> to get a quick estimate of which models fit your current GPU configuration without needing to actually attempt loading them.
+    </div>
+
+    <h3>Performance tuning</h3>
+    <p>
+      Once you have a model running, two flags are worth knowing about for squeezing more throughput. <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">--enable-chunked-prefill</code> splits long prefills across multiple forward passes, which reduces latency spikes on long prompts. <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">--max-num-batched-tokens</code> controls how many tokens are processed in a single batch — raising it helps throughput under high concurrency. Pass both via <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">EXTRA_ARGS</code>:
+    </p>
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-dots"><span></span><span></span><span></span></div>
+        <span class="code-label">bash</span>
+      </div>
+      <pre>-e <span class="var">EXTRA_ARGS</span>=<span class="str">"--enable-chunked-prefill --max-num-batched-tokens 8192"</span></pre>
+    </div>
+  </section>
+
+  <!-- ── SECTION 10 ── -->
+  <section class="animate">
+    <h2 data-num="10">Docker Compose Setup</h2>
+    <p>
+      If you're already running a stack with Docker Compose, dropping vLLM in as a service is straightforward. Create a <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">docker-compose.yml</code>:
+    </p>
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-dots"><span></span><span></span><span></span></div>
+        <span class="code-label">docker-compose.yml</span>
+      </div>
+      <pre><span class="var">services</span>:
+  <span class="var">vllm</span>:
+    <span class="kw">image</span>: vllm-universal
+    <span class="kw">ports</span>:
+      - <span class="str">"8000:8000"</span>
+    <span class="kw">volumes</span>:
+      - <span class="str">~/.cache/huggingface:/models</span>
+    <span class="kw">environment</span>:
+      - <span class="var">MODEL_ID</span>=<span class="str">mistralai/Mistral-7B-Instruct-v0.3</span>
+      - <span class="var">MAX_MODEL_LEN</span>=<span class="num">16384</span>
+      - <span class="var">GPU_MEMORY_UTILIZATION</span>=<span class="num">0.85</span>
+      - <span class="var">EXTRA_ARGS</span>=<span class="str">--api-key ${VLLM_API_KEY}</span>
+    <span class="kw">deploy</span>:
+      <span class="kw">resources</span>:
+        <span class="kw">reservations</span>:
+          <span class="kw">devices</span>:
+            - <span class="kw">driver</span>: nvidia
+              <span class="kw">count</span>: all
+              <span class="kw">capabilities</span>: [gpu]
+    <span class="kw">ipc</span>: host
+    <span class="kw">ulimits</span>:
+      <span class="kw">memlock</span>: -<span class="num">1</span>
+      <span class="kw">stack</span>: <span class="num">67108864</span>
+    <span class="kw">restart</span>: unless-stopped</pre>
+    </div>
+    <p>
+      Then bring it up with:
+    </p>
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-dots"><span></span><span></span><span></span></div>
+        <span class="code-label">bash</span>
+      </div>
+      <pre>VLLM_API_KEY=my-secret-key docker compose up -d</pre>
+    </div>
+    <div class="callout">
+      <strong>Tip:</strong> Store <code style="font-family:'DM Mono',monospace;font-size:0.88em">VLLM_API_KEY</code> in a <code style="font-family:'DM Mono',monospace;font-size:0.88em">.env</code> file alongside your compose file. Docker Compose picks it up automatically and keeps secrets out of your shell history.
+    </div>
+  </section>
+
+  <!-- ── SECTION 11 ── -->
+  <section class="animate">
+    <h2 data-num="11">Useful Commands to Keep Handy</h2>
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-dots"><span></span><span></span><span></span></div>
+        <span class="code-label">bash</span>
+      </div>
+      <pre><span class="cm"># Check available GPUs</span>
+nvidia-smi -L
+
+<span class="cm"># Monitor GPU utilization while model loads</span>
+nvtop
+
+<span class="cm"># Check available disk space (models are large)</span>
+df -h
+
+<span class="cm"># Check which models fit your GPU</span>
+llmfit
+
+<span class="cm"># List running containers</span>
+docker ps
+
+<span class="cm"># Stream container logs</span>
+docker container logs -f &lt;container_id&gt;
+
+<span class="cm"># Stop and remove a container</span>
+docker stop &lt;name&gt; && docker rm &lt;name&gt;</pre>
+    </div>
+  </section>
+
+  <!-- ── SECTION 12 ── -->
+  <section class="animate">
+    <h2 data-num="12">Wrapping Up</h2>
+    <p>
+      That's really the whole setup. One Dockerfile, one build, and from that point on hosting a new model is a single command. The volume mount means model weights survive container restarts, and the OpenAI-compatible API means you don't have to rewrite anything to switch from a cloud provider to your local GPU.
+    </p>
+    <p>
+      Where you go from here depends on your use case. For team environments, lock the endpoint down with <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">--api-key</code> and put a reverse proxy in front. For inference at scale, continuous batching and streaming are on by default — no extra configuration needed. For constrained hardware, reach for an AWQ-quantized model first before trying anything else. In the next post, we'll take this local vLLM endpoint a step further and wire it directly into <strong><a href="https://github.com/openclaw/openclaw" target="_blank" style="color:inherit;text-decoration:underline;text-decoration-color:var(--accent);text-underline-offset:3px;">OpenClaw</a></strong> — so your AI agent has a fully private, self-hosted brain to reason with.
+    </p>
+    <p>
+      For now though — if <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">curl localhost:8000/v1/models</code> returns your model name, you're in business.
+    </p>
+  </section>
+
+</main>
+
+<footer>
+  <span>vLLM + Docker · Local LLM Hosting Guide</span>
+  <span>March 2026</span>
+</footer>
+
+<script>
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach(e => {
+      if (e.isIntersecting) {
+        e.target.classList.add('visible');
+        observer.unobserve(e.target);
+      }
+    });
+  }, { threshold: 0.08 });
+
+  document.querySelectorAll('.animate').forEach(el => observer.observe(el));
+</script>
