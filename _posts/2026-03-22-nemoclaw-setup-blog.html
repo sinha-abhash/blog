@@ -1,0 +1,450 @@
+---
+layout: blogpost
+title: "Running OpenClaw Inside NemoClaw — A Field Guide"
+date: 2026-03-22
+author: "Abhash Sinha"
+categories: [AI, DevOps]
+tags: [nemoclaw, openclaw, vllm, sandbox, nvidia, dgx-spark]
+---
+
+<header>
+  <div class="tag">Engineering · AI Agents · Sandboxing</div>
+  <h1>Running <span>OpenClaw</span> Inside NemoClaw</h1>
+  <div class="meta">
+    <span>March 2026</span>
+    <span class="meta-dot">·</span>
+    <span>25 min read</span>
+    <span class="meta-dot">·</span>
+    <span>Requires: vLLM running on :8000</span>
+  </div>
+  <div class="hero-line"></div>
+</header>
+
+<main>
+
+  <p class="lead animate">
+    Running OpenClaw bare on the host gets you up and running fast — but the agent has broad access to your filesystem and network by default. NemoClaw changes that. It wraps OpenClaw in a Landlock + seccomp sandbox with explicit network policies, while keeping your local vLLM inference intact. This is the field guide for getting there — including everything that went wrong along the way.
+  </p>
+
+  <!-- ── SECTION 1 ── -->
+  <section class="animate">
+    <h2 data-num="01">What NemoClaw Actually Does</h2>
+    <p>
+      <strong><a href="https://github.com/NVIDIA/NemoClaw" style="color:inherit;text-decoration:underline;text-decoration-color:var(--accent);text-underline-offset:3px;">NemoClaw</a></strong> is NVIDIA's open-source security wrapper around OpenClaw. It runs your agent inside an OpenShell sandbox enforced by Landlock, seccomp, and network namespaces — meaning the agent can only touch approved filesystem paths and approved network endpoints. Everything else is denied at the kernel level.
+    </p>
+    <p>
+      Your existing OpenClaw installation outside the sandbox is completely untouched. Both run side by side — bare OpenClaw for quick tasks, sandboxed OpenClaw when the boundary matters.
+    </p>
+    <div class="callout warn">
+      <strong>Early Preview:</strong> NemoClaw is not production-ready as of March 2026. Interfaces and APIs may change without notice. Treat this as a field report, not stable documentation.
+    </div>
+  </section>
+
+  <!-- ── SECTION 2 ── -->
+  <section class="animate">
+    <h2 data-num="02">Before You Start</h2>
+    <p>
+      You'll need the following in place before anything else:
+    </p>
+    <ul style="margin: 0 0 20px 24px; color:var(--text-dim); line-height:2.1;">
+      <li><strong>Ubuntu 22.04+</strong> — required for Landlock kernel support</li>
+      <li><strong>Node.js v20+</strong> — v22 recommended</li>
+      <li><strong>Docker</strong> running — NemoClaw runs k3s inside Docker</li>
+      <li><strong>OpenShell</strong> — install via GitHub releases</li>
+      <li><strong>16 GB RAM</strong> recommended — sandbox image is ~2.4 GB compressed</li>
+      <li><strong>40 GB free disk</strong> recommended</li>
+    </ul>
+    <p>Install Node.js v22 and OpenShell:</p>
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-dots"><span></span><span></span><span></span></div>
+        <span class="code-label">bash</span>
+      </div>
+      <pre><span class="cm"># Install Node.js v22</span>
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo apt-get install -y nodejs
+
+<span class="cm"># Install OpenShell</span>
+ARCH=$(uname -m) && gh release download   --repo NVIDIA/OpenShell   --pattern "openshell-${ARCH}-unknown-linux-musl.tar.gz" && tar xzf openshell-${ARCH}-unknown-linux-musl.tar.gz && sudo install -m 755 openshell /usr/local/bin/openshell</pre>
+    </div>
+  </section>
+
+  <!-- ── SECTION 3 ── -->
+  <section class="animate">
+    <h2 data-num="03">Install NemoClaw and Onboard</h2>
+    <p>
+      A single installer script handles everything — the sandbox image, the gateway, and the guided onboard wizard:
+    </p>
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-dots"><span></span><span></span><span></span></div>
+        <span class="code-label">bash</span>
+      </div>
+      <pre>curl -fsSL https://nvidia.com/nemoclaw.sh | bash</pre>
+    </div>
+    <p>
+      The wizard runs through 7 steps. At step 4 it asks for an NVIDIA API key to configure the NIM inference provider. If you're planning to use local vLLM (which we are), you don't need a real key — but the wizard validates the format and rejects anything that doesn't start with <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">nvapi-</code>.
+    </p>
+    <div class="callout warn">
+      <strong>Key format gotcha:</strong> Entering a plain dummy value like <code style="font-family:'DM Mono',monospace;font-size:0.88em">dummykey</code> will be rejected with <em>"Invalid key. Must start with nvapi-"</em>. Use <code style="font-family:'DM Mono',monospace;font-size:0.88em">nvapi-dummykey</code> to pass validation. You'll switch to vllm-local immediately after onboarding anyway.
+    </div>
+    <div class="screenshot-wrap">
+      <img src="{{ site.baseurl }}/assets/images/nemoclaw-openclaw/dummy_key.png" alt="NemoClaw onboarding step 4 — NVIDIA API key prompt with nvapi-dummykey entered and cloud model list showing" />
+      <p class="screenshot-caption">Step 4/7: API key prompt accepts the placeholder, then lists available cloud models — select GPT-OSS 120B (option 6) or any model, since we'll switch providers right after.</p>
+    </div>
+    <p>
+      At step 7, the wizard shows available network policy presets. Use <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">Space</code> to toggle and <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">Enter</code> to confirm. Select at minimum <strong>npm</strong> and <strong>pypi</strong> — add <strong>huggingface</strong> if you work with models directly.
+    </p>
+    <div class="screenshot-wrap">
+      <img src="{{ site.baseurl }}/assets/images/nemoclaw-openclaw/policy.png" alt="NemoClaw onboarding step 7 — policy presets selection screen showing npm and pypi as suggested" />
+      <p class="screenshot-caption">Step 7/7: Policy presets. The wizard suggests pypi and npm — accept both. You can add more later with <code style="font-family:'DM Mono',monospace;font-size:0.85em">nemoclaw dtx-claw policy-add</code>.</p>
+    </div>
+    <p>When complete, you'll see a summary like:</p>
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-dots"><span></span><span></span><span></span></div>
+        <span class="code-label">output</span>
+      </div>
+      <pre>Sandbox      <span class="str">dtx-claw</span> (Landlock + seccomp + netns)
+Model        <span class="str">openai/gpt-oss-120b</span> (NVIDIA Cloud API)
+──────────────────────────────────────────────────
+Run:         nemoclaw dtx-claw connect
+Status:      nemoclaw dtx-claw status</pre>
+    </div>
+    <div class="callout">
+      <strong>Remember your sandbox name.</strong> Whatever you chose during onboarding — <code style="font-family:'DM Mono',monospace;font-size:0.88em">dtx-claw</code> in our case — must be used in every NemoClaw command. The docs show <code style="font-family:'DM Mono',monospace;font-size:0.88em">my-assistant</code> as an example, but that's not your sandbox name unless you actually typed it.
+    </div>
+  </section>
+
+  <!-- ── SECTION 4 ── -->
+  <section class="animate">
+    <h2 data-num="04">Point NemoClaw at Your Local vLLM</h2>
+    <p>
+      By default NemoClaw uses the NVIDIA cloud API which incurs per-token costs. To run entirely on your own GPU, you need to create a local provider and switch to it. All five steps run on the host, not inside the sandbox.
+    </p>
+
+    <h3>Step 1 — Find your exact model name</h3>
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-dots"><span></span><span></span><span></span></div>
+        <span class="code-label">bash</span>
+      </div>
+      <pre>curl http://localhost:8000/v1/models</pre>
+    </div>
+    <p>
+      Note the <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">id</code> field exactly. vLLM may report <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">gpt-oss-120b</code> even when started with <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">openai/gpt-oss-120b</code>. Always use what the API reports, not what you passed at startup.
+    </p>
+
+    <h3>Step 2 — Create the vllm-local provider</h3>
+    <div class="callout warn">
+      <strong>Known bug:</strong> <code style="font-family:'DM Mono',monospace;font-size:0.88em">vllm-local</code> is not registered during onboarding. It must be created manually — and recreated any time you destroy and re-onboard the sandbox.
+    </div>
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-dots"><span></span><span></span><span></span></div>
+        <span class="code-label">bash</span>
+      </div>
+      <pre>openshell provider create   --name vllm-local   --type openai   --credential <span class="var">OPENAI_API_KEY</span>=dummy   --config <span class="var">OPENAI_BASE_URL</span>=http://host.openshell.internal:8000/v1</pre>
+    </div>
+    <p>
+      Use <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">host.openshell.internal</code> — never <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">localhost</code>. Inside the sandbox's network namespace, <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">localhost</code> resolves to the sandbox itself, not your host machine.
+    </p>
+
+    <h3>Step 3 — Open the firewall</h3>
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-dots"><span></span><span></span><span></span></div>
+        <span class="code-label">bash</span>
+      </div>
+      <pre>sudo ufw allow proto tcp from 172.18.0.0/16 to any port 8000 comment <span class="str">'OpenShell cluster to vLLM'</span>
+sudo ufw allow proto tcp from 172.17.0.0/16 to any port 8000 comment <span class="str">'Docker bridge to vLLM'</span></pre>
+    </div>
+
+    <h3>Step 4 — Switch the active provider</h3>
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-dots"><span></span><span></span><span></span></div>
+        <span class="code-label">bash</span>
+      </div>
+      <pre>openshell inference set --provider vllm-local --model <span class="str">&lt;id-from-step-1&gt;</span></pre>
+    </div>
+
+    <h3>Step 5 — Verify</h3>
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-dots"><span></span><span></span><span></span></div>
+        <span class="code-label">bash</span>
+      </div>
+      <pre>openshell inference get
+<span class="cm"># Expected: Provider: vllm-local, Model: gpt-oss-120b</span></pre>
+    </div>
+    <div class="callout">
+      <strong>Best confirmation:</strong> Watch your vLLM server logs while chatting in OpenClaw. Each response should produce a <code style="font-family:'DM Mono',monospace;font-size:0.88em">POST /v1/chat/completions HTTP/1.1" 200 OK</code> line. If you don't see traffic, the provider switch didn't take — recheck with <code style="font-family:'DM Mono',monospace;font-size:0.88em">openshell inference get</code>.
+    </div>
+    <div class="screenshot-wrap">
+      <img src="{{ site.baseurl }}/assets/images/nemoclaw-openclaw/vllm_server_logs.png" alt="vLLM server logs showing POST /v1/chat/completions HTTP/1.1 200 OK confirming inference is routed locally" />
+      <p class="screenshot-caption">vLLM server logs confirming each chat message routes through local inference. This is the most reliable way to verify the provider switch actually took.</p>
+    </div>
+  </section>
+
+  <!-- ── SECTION 5 ── -->
+  <section class="animate">
+    <h2 data-num="05">Accessing the Web UI</h2>
+    <p>
+      NemoClaw's gateway serves a full browser-based interface for OpenClaw. Connect to the sandbox first, then generate the authenticated URL:
+    </p>
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-dots"><span></span><span></span><span></span></div>
+        <span class="code-label">bash</span>
+      </div>
+      <pre><span class="cm"># Connect to sandbox</span>
+nemoclaw dtx-claw connect
+
+<span class="cm"># Get dashboard URL with embedded auth token</span>
+openclaw dashboard --no-open</pre>
+    </div>
+    <p>
+      Copy the printed URL and open it directly in your browser — it includes the auth token as a query parameter so no login is required.
+    </p>
+    <div class="callout danger">
+      <strong>Never navigate directly to the port.</strong> The Web UI auto-retries without a valid token and hits a rate limit fast. Once locked out, you have to wait for the cooldown. Always use <code style="font-family:'DM Mono',monospace;font-size:0.88em">openclaw dashboard --no-open</code> to generate a pre-authenticated URL.
+    </div>
+    <div class="screenshot-wrap">
+      <img src="{{ site.baseurl }}/assets/images/nemoclaw-openclaw/chat_conversation.png" alt="OpenClaw web UI showing a chat conversation with the sandboxed agent responding via local vLLM" />
+      <p class="screenshot-caption">OpenClaw's Web UI running inside the NemoClaw sandbox — inference routed through local vLLM, no cloud API involved.</p>
+    </div>
+  </section>
+
+  <!-- ── SECTION 6 ── -->
+  <section class="animate">
+    <h2 data-num="06">Editing Config Inside the Sandbox</h2>
+    <p>
+      OpenClaw's config inside the sandbox lives at <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">/sandbox/.openclaw/openclaw.json</code> — but this path is Landlock read-only. You cannot write there directly. There are two ways around it.
+    </p>
+
+    <h3>Option A — Use the CLI</h3>
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-dots"><span></span><span></span><span></span></div>
+        <span class="code-label">bash</span>
+      </div>
+      <pre><span class="cm"># Read a value</span>
+openclaw config get &lt;dot.path&gt;
+
+<span class="cm"># Set a value</span>
+openclaw config set &lt;dot.path&gt; &lt;value&gt;
+
+<span class="cm"># Validate</span>
+openclaw config validate</pre>
+    </div>
+
+    <h3>Option B — Copy to a writable location</h3>
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-dots"><span></span><span></span><span></span></div>
+        <span class="code-label">bash</span>
+      </div>
+      <pre><span class="cm"># Copy config to writable path</span>
+cp /sandbox/.openclaw/openclaw.json /sandbox/.openclaw-data/openclaw.json
+
+<span class="cm"># Point OpenClaw at the writable copy</span>
+echo <span class="str">'export OPENCLAW_CONFIG_PATH=/sandbox/.openclaw-data/openclaw.json'</span> >> ~/.bashrc
+source ~/.bashrc</pre>
+    </div>
+    <div class="callout">
+      <strong>Note:</strong> The Web UI config editor uses JSON5 syntax — unquoted keys and trailing commas are valid. This is intentional, not a bug.
+    </div>
+  </section>
+
+  <!-- ── SECTION 7 ── -->
+  <section class="animate">
+    <h2 data-num="07">Things Nobody Warns You About</h2>
+
+    <h3><code>vllm-local</code> not auto-registered</h3>
+    <p>
+      The docs say to run <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">openshell inference set --provider vllm-local</code> but the provider doesn't exist until you create it manually. Always run <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">openshell provider create</code> first — and again after every <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">destroy</code>.
+    </p>
+
+    <h3>Use <code>host.openshell.internal</code>, not <code>localhost</code></h3>
+    <p>
+      Inside the sandbox's network namespace, <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">localhost</code> resolves to the sandbox itself. Any provider URL pointing at <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">localhost</code> will silently fail to reach your host's vLLM server.
+    </p>
+
+    <h3><code>destroy</code> wipes everything — and there's no <code>stop</code></h3>
+    <p>
+      <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">nemoclaw dtx-claw destroy</code> deletes the sandbox and all data inside it — including your custom provider config. There is no <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">stop</code> or <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">start</code>. If you just want to detach from the sandbox temporarily, close the terminal or press <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">Ctrl+D</code> — the sandbox keeps running in the background. Valid actions are <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">connect</code>, <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">status</code>, <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">logs</code>, <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">policy-add</code>, <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">policy-list</code>, and <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">destroy</code>.
+    </p>
+
+    <h3>The gateway runs on the host, not in the sandbox</h3>
+    <p>
+      Running <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">openclaw gateway restart</code> inside the sandbox has no effect on the actual running gateway. To reload it, reconnect from the host with <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">nemoclaw dtx-claw connect</code>.
+    </p>
+
+    <h3>File extraction via base64</h3>
+    <p>
+      <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">kubectl cp</code> and <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">openshell cp</code> may fail with TLS errors. The reliable method: <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">base64 /path/to/file</code> inside the sandbox, then decode on the host with <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">echo "..." | base64 -d > filename</code>.
+    </p>
+
+    <h3>npm policy ≠ npm works</h3>
+    <p>
+      Selecting the npm network policy during onboarding doesn't automatically unblock all npm traffic. The binary path in the policy must exactly match the binary making the outbound call. Check <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">nemoclaw dtx-claw logs</code> for <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">CONNECT action=deny</code> entries if npm installs are silently failing.
+    </p>
+  </section>
+
+  <!-- ── SECTION 8 ── -->
+  <section class="animate">
+    <h2 data-num="08">Automating Restarts with start-ai.sh</h2>
+    <p>
+      After a machine reboot, you need to bring up vLLM, and then reconnect NemoClaw — and recreate the <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">vllm-local</code> provider every time since it gets wiped on each onboard. Doing this manually gets tedious fast.
+    </p>
+    <p>
+      The <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">start-ai.sh</code> script handles the NemoClaw side in one command. For NemoClaw specifically, it:
+    </p>
+    <ul style="margin: 0 0 20px 24px; color:var(--text-dim); line-height:2.1;">
+      <li>Frees port 18789 if anything is squatting on it</li>
+      <li>Kills any stale openshell gateway on port 8080</li>
+      <li>Runs <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">nemoclaw onboard</code> and auto-answers the "Recreate?" prompt</li>
+      <li>Recreates the <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">vllm-local</code> provider automatically</li>
+      <li>Switches inference to <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">vllm-local / gpt-oss-120b</code></li>
+      <li>Connects to the sandbox and attempts to print the dashboard URL</li>
+    </ul>
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-dots"><span></span><span></span><span></span></div>
+        <span class="code-label">bash</span>
+      </div>
+      <pre>./start-ai.sh &lt;vllm-container-id&gt;</pre>
+    </div>
+    <div class="callout">
+      <strong>Usage:</strong> Pass your vLLM Docker container ID as the only argument. The script confirms the container exists, waits for vLLM to be ready, then walks through each phase interactively — asking whether to start host OpenClaw and NemoClaw separately.
+    </div>
+  </section>
+
+  <!-- ── SECTION 9 ── -->
+  <section class="animate">
+    <h2 data-num="09">Post-Install: File Explorer Crash</h2>
+    <p>
+      After completing the NemoClaw installation, you may find that Nautilus silently refuses to open. Running it in a terminal reveals a segfault:
+    </p>
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-dots"><span></span><span></span><span></span></div>
+        <span class="code-label">output</span>
+      </div>
+      <pre>(org.gnome.Nautilus:142157): Adwaita-WARNING **: No known Yaru accent 'nvidia'
+Segmentation fault (core dumped)</pre>
+    </div>
+    <p>
+      The NemoClaw installer sets the GTK theme to <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">Yaru-nvidia-dark</code> and configures NVIDIA GPU acceleration hooks. GTK4 tries to use those hooks, fails, and crashes. Confirm it's the cause:
+    </p>
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-dots"><span></span><span></span><span></span></div>
+        <span class="code-label">bash</span>
+      </div>
+      <pre>gsettings get org.gnome.desktop.interface gtk-theme
+<span class="cm"># Returns: 'Yaru-nvidia-dark'  ← the culprit</span></pre>
+    </div>
+    <p>
+      Fix it by forcing GTK4 to use software rendering permanently:
+    </p>
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-dots"><span></span><span></span><span></span></div>
+        <span class="code-label">bash</span>
+      </div>
+      <pre><span class="cm"># Create the environment config</span>
+mkdir -p ~/.config/environment.d
+echo <span class="str">'GSK_RENDERER=cairo'</span> > ~/.config/environment.d/gsk-renderer.conf
+
+<span class="cm"># Apply to the current live session without logout</span>
+dbus-update-activation-environment --systemd GSK_RENDERER=cairo
+systemctl --user set-environment GSK_RENDERER=cairo
+
+<span class="cm"># Relaunch Nautilus</span>
+pkill -9 nautilus && sleep 1 && nautilus &</pre>
+    </div>
+    <div class="callout">
+      <strong>Confirmed working:</strong> After a full reboot, Nautilus opens normally from the dock. The <code style="font-family:'DM Mono',monospace;font-size:0.88em">~/.config/environment.d/</code> file ensures the variable is set on every login. This fix is entirely independent of your OpenClaw and NemoClaw installation — the sandbox doesn't use GTK.
+    </div>
+    <p>
+      If your browser went dark during troubleshooting after switching the GTK theme, restore it with:
+    </p>
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-dots"><span></span><span></span><span></span></div>
+        <span class="code-label">bash</span>
+      </div>
+      <pre>gsettings set org.gnome.desktop.interface color-scheme <span class="str">'default'</span></pre>
+    </div>
+  </section>
+
+  <!-- ── SECTION 10 ── -->
+  <section class="animate">
+    <h2 data-num="10">Daily Driver Commands</h2>
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-dots"><span></span><span></span><span></span></div>
+        <span class="code-label">bash</span>
+      </div>
+      <pre><span class="cm"># Connect to sandbox</span>
+nemoclaw dtx-claw connect
+
+<span class="cm"># Get Web UI URL with embedded auth token</span>
+openclaw dashboard --no-open
+
+<span class="cm"># Check sandbox status and gateway port</span>
+nemoclaw dtx-claw status
+
+<span class="cm"># Stream sandbox logs</span>
+nemoclaw dtx-claw logs --follow
+
+<span class="cm"># Check active inference provider</span>
+openshell inference get
+
+<span class="cm"># Switch to local vLLM</span>
+openshell inference set --provider vllm-local --model &lt;model-id&gt;
+
+<span class="cm"># Add a network policy</span>
+nemoclaw dtx-claw policy-add
+
+<span class="cm"># Extract a file from the sandbox</span>
+base64 /path/to/file          <span class="cm"># inside sandbox</span>
+echo "..." | base64 -d > file <span class="cm"># on host</span></pre>
+    </div>
+  </section>
+
+  <!-- ── SECTION 11 ── -->
+  <section class="animate">
+    <h2 data-num="11">Wrapping Up</h2>
+    <p>
+      At this point OpenClaw is running inside a proper sandbox — Landlock filesystem restrictions, seccomp syscall filtering, and network access locked to an explicit allowlist. Your vLLM server connects in via <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">host.openshell.internal</code>, keeping all inference local while the agent operates under meaningful constraints.
+    </p>
+    <p>
+      The parts that bite most people: <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">vllm-local</code> not existing until you create it, <code style="font-family:'DM Mono',monospace;color:var(--accent);font-size:0.88em">localhost</code> silently resolving to the sandbox, and the Web UI lockout from navigating to the bare port. All documented above.
+    </p>
+    <p>
+      If you haven't set up bare OpenClaw with a local vLLM model first, the <a href="2026-03-22-openclaw-blog.html" style="color:inherit;text-decoration:underline;text-decoration-color:var(--accent);text-underline-offset:3px;">previous post</a> covers that foundation — this guide builds directly on top of it.
+    </p>
+  </section>
+
+</main>
+
+<footer>
+  <span>NemoClaw + OpenClaw · Sandboxed Local AI Agent</span>
+  <span>March 2026</span>
+</footer>
+
+<script>
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach(e => {
+      if (e.isIntersecting) {
+        e.target.classList.add('visible');
+        observer.unobserve(e.target);
+      }
+    });
+  }, { threshold: 0.08 });
+
+  document.querySelectorAll('.animate').forEach(el => observer.observe(el));
+</script>
